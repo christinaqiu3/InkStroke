@@ -1,0 +1,125 @@
+bl_info = {
+    "name": "InkStroke",
+    "author": "Christina Qiu",
+    "version": (1, 0),
+    "blender": (3, 0, 0),
+    "location": "View3D > Sidebar > InkStroke",
+    "category": "3D View",
+}
+
+import bpy
+from bpy.types import Operator, Panel
+from bpy_extras import view3d_utils
+
+
+# -----------------------------
+# Draw Operator
+# -----------------------------
+import mathutils
+
+class INKSTROKE_OT_draw(Operator):
+    bl_idname = "inkstroke.draw"
+    bl_label = "InkStroke Draw"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    drawing = False
+    curve_obj = None
+    spline = None
+
+    def modal(self, context, event):
+        if event.type == 'LEFTMOUSE':
+            if event.value == 'PRESS':
+                self.start_stroke(context, event)
+                self.drawing = True
+
+            elif event.value == 'RELEASE':
+                self.drawing = False
+                self.finish_stroke(context)
+                return {'FINISHED'}
+
+        elif event.type == 'MOUSEMOVE' and self.drawing:
+            self.add_point(context, event)
+
+        elif event.type in {'RIGHTMOUSE', 'ESC'}:
+            return {'CANCELLED'}
+
+        return {'RUNNING_MODAL'}
+
+    def invoke(self, context, event):
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def start_stroke(self, context, event):
+        curve_data = bpy.data.curves.new("InkStroke", type='CURVE')
+        curve_data.dimensions = '3D'
+        curve_data.bevel_depth = 0.01
+        curve_data.bevel_resolution = 3
+
+        self.spline = curve_data.splines.new('BEZIER')
+        self.spline.bezier_points.add(0)
+
+        self.curve_obj = bpy.data.objects.new("InkStrokeObj", curve_data)
+        context.collection.objects.link(self.curve_obj)
+
+        context.view_layer.objects.active = self.curve_obj
+        self.curve_obj.select_set(True)
+
+        self.add_point(context, event)
+
+    def add_point(self, context, event):
+        region = context.region
+        rv3d = context.region_data
+        coord = (event.mouse_region_x, event.mouse_region_y)
+
+        location = view3d_utils.region_2d_to_location_3d(
+            region, rv3d, coord, rv3d.view_location
+        )
+
+        bp = self.spline.bezier_points[-1]
+        bp.co = location
+        bp.handle_left_type = 'AUTO'
+        bp.handle_right_type = 'AUTO'
+
+        self.spline.bezier_points.add(1)
+
+    def finish_stroke(self, context):
+        # Switch to Edit Mode so points are editable
+        bpy.ops.object.mode_set(mode='EDIT')
+
+        # Select all Bezier points
+        bpy.ops.curve.select_all(action='SELECT')
+
+
+# -----------------------------
+# UI Panel
+# -----------------------------
+class INKSTROKE_PT_panel(Panel):
+    bl_label = "InkStroke"
+    bl_idname = "INKSTROKE_PT_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'InkStroke'
+
+    def draw(self, context):
+        layout = self.layout
+        layout.operator("inkstroke.draw", text="Draw", icon='GREASEPENCIL')
+
+
+# -----------------------------
+# Registration
+# -----------------------------
+classes = (
+    INKSTROKE_OT_draw,
+    INKSTROKE_PT_panel,
+)
+
+def register():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+def unregister():
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
+
+if __name__ == "__main__":
+    register()
