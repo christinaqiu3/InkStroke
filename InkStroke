@@ -266,6 +266,15 @@ class INKSTROKE_OT_generate_bands(Operator):
 
         mesh.from_pydata(verts, [], faces)
         mesh.update()
+        
+        # Assign material
+        # mat = get_inkstroke_material()
+
+        # if len(stroke_obj.data.materials) == 0:
+        #     stroke_obj.data.materials.append(mat)
+        # else:
+        #     stroke_obj.data.materials[0] = mat
+
 
         # UV Layer
         uv_layer = mesh.uv_layers.new(name="UVMap")
