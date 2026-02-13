@@ -26,6 +26,14 @@ class INKSTROKE_OT_draw(Operator):
     curve_obj = None
     spline = None
 
+    drawing = False
+    curve_obj = None
+    spline = None
+    last_point = None
+
+    # Smoothing distance
+    min_distance = 0.15
+
     def modal(self, context, event):
         if event.type == 'LEFTMOUSE':
             if event.value == 'PRESS':
@@ -63,21 +71,29 @@ class INKSTROKE_OT_draw(Operator):
         context.view_layer.objects.active = self.curve_obj
         self.curve_obj.select_set(True)
 
-        # Initialize first point correctly
         location = self.mouse_to_3d(context, event)
+
         bp = self.spline.bezier_points[0]
         bp.co = location
         bp.handle_left_type = 'AUTO'
         bp.handle_right_type = 'AUTO'
 
+        self.last_point = location
+
     def add_point(self, context, event):
         location = self.mouse_to_3d(context, event)
+
+        # Distance-based smoothing
+        if (location - self.last_point).length < self.min_distance:
+            return
 
         self.spline.bezier_points.add(1)
         bp = self.spline.bezier_points[-1]
         bp.co = location
         bp.handle_left_type = 'AUTO'
         bp.handle_right_type = 'AUTO'
+
+        self.last_point = location
 
     def finish_stroke(self, context):
         bpy.ops.object.mode_set(mode='EDIT')
