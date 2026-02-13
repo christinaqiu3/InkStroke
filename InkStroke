@@ -12,6 +12,59 @@ from bpy.types import Operator, Panel
 from bpy_extras import view3d_utils
 
 
+# Material
+
+def get_inkstroke_material():
+
+    mat_name = "InkStroke_Material"
+
+    # Reuse if already exists
+    if mat_name in bpy.data.materials:
+        return bpy.data.materials[mat_name]
+
+    mat = bpy.data.materials.new(mat_name)
+    mat.use_nodes = True
+
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+
+    nodes.clear()
+
+    # Nodes
+    output = nodes.new("ShaderNodeOutputMaterial")
+    principled = nodes.new("ShaderNodeBsdfPrincipled")
+    texcoord = nodes.new("ShaderNodeTexCoord")
+    separate = nodes.new("ShaderNodeSeparateXYZ")
+    noise = nodes.new("ShaderNodeTexNoise")
+    colramp = nodes.new("ShaderNodeValToRGB")
+
+    # Layout for cleanliness
+    texcoord.location = (-800, 0)
+    separate.location = (-600, 0)
+    noise.location = (-400, 0)
+    colramp.location = (-200, 0)
+    principled.location = (0, 0)
+    output.location = (200, 0)
+
+    # Settings
+    noise.inputs["Scale"].default_value = 20
+    noise.inputs["Roughness"].default_value = 0.6
+
+    colramp.color_ramp.elements[0].position = 0.3
+    colramp.color_ramp.elements[1].position = 0.7
+
+    principled.inputs["Base Color"].default_value = (0.02, 0.02, 0.02, 1)
+
+    # Links
+    links.new(texcoord.outputs["UV"], separate.inputs["Vector"])
+    links.new(separate.outputs["X"], noise.inputs["Vector"])
+    links.new(noise.outputs["Fac"], colramp.inputs["Fac"])
+    links.new(colramp.outputs["Color"], principled.inputs["Base Color"])
+    links.new(principled.outputs["BSDF"], output.inputs["Surface"])
+
+    return mat
+
+
 # -----------------------------
 # Draw Operator
 # -----------------------------
