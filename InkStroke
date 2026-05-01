@@ -13,7 +13,10 @@ from bpy_extras import view3d_utils
 from mathutils import Vector
 import math
 import blf
+import os
 import random
+
+PRESET_FOLDER = os.path.join(os.path.dirname(__file__), "presets")
 
 # -----------------------------
 # GLOBALS (shared state)
@@ -31,6 +34,20 @@ def mark_dirty(self, context):
     if obj:
         obj["inkstroke_dirty"] = True
 
+def update_panel_depth(self, context):
+    global panel_depth
+    panel_depth = self.panel_depth
+
+
+def update_use_projection(self, context):
+    if self.use_projection and self.panel_mode:
+        self.panel_mode = False
+
+
+def update_panel_mode(self, context):
+    if self.panel_mode and self.use_projection:
+        self.use_projection = False
+
 # -----------------------------
 # RAY → PLANE INTERSECTION
 # -----------------------------
@@ -41,6 +58,26 @@ def intersect_ray_plane(ray_origin, ray_dir, plane_point, plane_normal):
 
     t = (plane_point - ray_origin).dot(plane_normal) / denom
     return ray_origin + ray_dir * t
+
+
+def get_preset_files(self, context):
+    items = []
+    if os.path.isdir(PRESET_FOLDER):
+        for filename in sorted(os.listdir(PRESET_FOLDER)):
+            if filename.endswith('.blend'):
+                label = os.path.splitext(filename)[0]
+                items.append((filename, label, "Load stroke preset from file"))
+    if not items:
+        items.append(("NONE", "No presets found", ""))
+    return items
+
+
+def load_preset_blend(path):
+    if not os.path.exists(path):
+        return None
+    with bpy.data.libraries.load(path, link=False) as (data_from, data_to):
+        data_to.objects = data_from.objects
+    return data_to.objects
 
 
 import gpu
@@ -137,20 +174,7 @@ class INKSTROKE_OT_set_panel_depth(bpy.types.Operator):
             panel_normal = view_dir.normalized()
 
             # -----------------------------
-            # CASE 1: USE SELECTED OBJECT
-            # -----------------------------
-            if context.active_object:
-                obj = context.active_object
-                panel_object = obj
-                panel_origin = obj.location
-
-                panel_depth = (panel_origin - cam_loc).length
-
-                self.report({'INFO'}, f"Panel set from selected object {obj.name}")
-                return {'FINISHED'}
-
-            # -----------------------------
-            # CASE 2: RAYCAST
+            # RAYCAST TO SET PANEL
             # -----------------------------
             hit, location, normal, index, obj, matrix = context.scene.ray_cast(
                 context.evaluated_depsgraph_get(),
@@ -162,6 +186,9 @@ class INKSTROKE_OT_set_panel_depth(bpy.types.Operator):
                 panel_origin = location
                 panel_object = obj
                 panel_depth = (location - cam_loc).length
+
+                # Update the settings slider
+                context.scene.inkstroke_settings.panel_depth = panel_depth
 
                 # highlight object
                 bpy.ops.object.select_all(action='DESELECT')
@@ -176,11 +203,14 @@ class INKSTROKE_OT_set_panel_depth(bpy.types.Operator):
 
             else:
                 # -----------------------------
-                # CASE 3: EMPTY SPACE
+                # EMPTY SPACE
                 # -----------------------------
-                panel_depth = 5.0  # default distance
+                panel_depth = context.scene.inkstroke_settings.panel_depth  # use slider value
                 panel_origin = cam_loc + direction * panel_depth
                 panel_object = None
+
+                # Update the settings slider (already set)
+                context.scene.inkstroke_settings.panel_depth = panel_depth
 
                 bpy.ops.object.select_all(action='DESELECT')
 
@@ -199,7 +229,8 @@ class INKSTROKE_OT_set_panel_depth(bpy.types.Operator):
 class InkStrokeSettings(bpy.types.PropertyGroup):
     use_projection: bpy.props.BoolProperty(
         name="Surface Projection",
-        default=False
+        default=False,
+        update=update_use_projection
     )
     min_distance: bpy.props.FloatProperty(
         name="Point Spacing",
@@ -210,9 +241,9 @@ class InkStrokeSettings(bpy.types.PropertyGroup):
     )
     width: bpy.props.FloatProperty(
         name="Stroke Width",
-        default=0.05,
-        min=0.001,
-        max=1.0,
+        default=.5,
+        min=0.01,
+        max=5.0,
         update=mark_dirty
     )
     width_falloff: bpy.props.FloatProperty(
@@ -224,12 +255,16 @@ class InkStrokeSettings(bpy.types.PropertyGroup):
     )
     panel_mode: bpy.props.BoolProperty(
         name="2D Panel Mode",
-        default=False
+        default=True,
+        update=update_panel_mode
     )
 
     panel_depth: bpy.props.FloatProperty(
         name="Panel Depth",
-        default=5.0
+        default=5.0,
+        min=0.1,
+        max=50.0,
+        update=update_panel_depth
     )
 
     recording_enabled: bpy.props.BoolProperty(
@@ -244,6 +279,12 @@ class InkStrokeSettings(bpy.types.PropertyGroup):
         default=0,
         min=0,
         max=10000
+    )
+
+    stroke_preset: bpy.props.EnumProperty(
+        name="Stroke Preset",
+        description="Choose a preset to load for the stroke generator",
+        items=get_preset_files
     )
 
 # Material
@@ -320,7 +361,6 @@ def inkstroke_live_update(scene):
 
 # -----------------------------
 # HELPER: GET DRAW POINT
-# (use this in your drawing operator)
 # -----------------------------
 def get_draw_point(context, coord):
     global panel_origin, panel_normal
@@ -379,10 +419,25 @@ class INKSTROKE_OT_draw(Operator):
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
+    def update_point_radii(self):
+        settings = bpy.context.scene.inkstroke_settings
+        total = len(self.spline.bezier_points)
+        if total == 0:
+            return
+
+        for i, bp in enumerate(self.spline.bezier_points):
+            if total == 1:
+                taper = 1.0
+            else:
+                u = i / (total - 1)
+                taper = (4 * u * (1 - u)) ** settings.width_falloff
+            bp.radius = max(0.001, settings.width * taper)
+
     def start_stroke(self, context, event):
+        settings = context.scene.inkstroke_settings
         curve_data = bpy.data.curves.new("InkStroke", type='CURVE')
         curve_data.dimensions = '3D'
-        curve_data.bevel_depth = 0.01
+        curve_data.bevel_depth = 1.0
         curve_data.bevel_resolution = 3
 
         self.spline = curve_data.splines.new('BEZIER')
@@ -396,22 +451,21 @@ class INKSTROKE_OT_draw(Operator):
         location = self.mouse_to_3d(context, event)
 
         bp = self.spline.bezier_points[0]
-        bp.radius = 1.0
         bp.co = location
         bp.handle_left_type = 'AUTO'
         bp.handle_right_type = 'AUTO'
+        self.update_point_radii()
+        context.area.tag_redraw()
 
         self.last_point = location
 
         # Record stroke creation if recording is enabled
-        settings = context.scene.inkstroke_settings
         if settings.recording_enabled:
             stroke_count = len([o for o in context.scene.objects if "inkstroke_order" in o])
             self.curve_obj["inkstroke_order"] = stroke_count
 
     def add_point(self, context, event):
         location = self.mouse_to_3d(context, event)
-
 
         settings = context.scene.inkstroke_settings
         
@@ -422,12 +476,13 @@ class INKSTROKE_OT_draw(Operator):
 
         self.spline.bezier_points.add(1)
         bp = self.spline.bezier_points[-1]
-        bp.radius = 1.0
         bp.co = location
         bp.handle_left_type = 'AUTO'
         bp.handle_right_type = 'AUTO'
 
         self.last_point = location
+        self.update_point_radii()
+        context.area.tag_redraw()
 
     def finish_stroke(self, context):
 
@@ -672,6 +727,55 @@ class INKSTROKE_OT_generate_bands(Operator):
             uv_layer.data[i].uv = uvs[i]
 
         return {'FINISHED'}
+
+
+class INKSTROKE_OT_apply_material(Operator):
+    bl_idname = "inkstroke.apply_material"
+    bl_label = "Apply Ink Material"
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type not in {'CURVE', 'MESH'}:
+            self.report({'ERROR'}, "Select a curve or mesh first")
+            return {'CANCELLED'}
+
+        mat = get_inkstroke_material()
+        if not obj.data.materials:
+            obj.data.materials.append(mat)
+        else:
+            obj.data.materials[0] = mat
+
+        self.report({'INFO'}, "Ink material assigned")
+        return {'FINISHED'}
+
+
+class INKSTROKE_OT_load_preset(Operator):
+    bl_idname = "inkstroke.load_preset"
+    bl_label = "Load Stroke Preset"
+
+    def execute(self, context):
+        settings = context.scene.inkstroke_settings
+        preset = settings.stroke_preset
+        if preset == "NONE" or not preset:
+            self.report({'WARNING'}, "No preset selected")
+            return {'CANCELLED'}
+
+        path = os.path.join(PRESET_FOLDER, preset)
+        if not os.path.exists(path):
+            self.report({'ERROR'}, f"Preset file not found: {preset}")
+            return {'CANCELLED'}
+
+        loaded = load_preset_blend(path)
+        if not loaded:
+            self.report({'ERROR'}, "Preset failed to load")
+            return {'CANCELLED'}
+
+        for obj in loaded:
+            if obj is not None:
+                context.collection.objects.link(obj)
+        self.report({'INFO'}, f"Preset loaded: {preset}")
+        return {'FINISHED'}
+
 
 def regenerate_mesh_from_curve(curve_obj, mesh_obj):
     settings = bpy.context.scene.inkstroke_settings
@@ -920,7 +1024,7 @@ class INKSTROKE_OT_radius_tool(bpy.types.Operator):
         mouse = Vector((event.mouse_region_x, event.mouse_region_y))
 
         obj = context.active_object
-        bpy.context.view_layer.update()  # 🔥 CRITICAL
+        bpy.context.view_layer.update()  # important
 
         closest = None
         min_dist = 30.0
@@ -950,47 +1054,27 @@ replay_handler = None
 playback_state = {"original_curves": {}, "total_points": 0}
 
 def setup_playback_state(context):
-    """Initialize playback by storing original curves and counting total points"""
+    """Initialize playback by counting recorded stroke objects"""
     global playback_state
-    playback_state = {"original_curves": {}, "total_points": 0}
-    
     strokes = [o for o in context.scene.objects if "inkstroke_order" in o]
     strokes.sort(key=lambda x: x["inkstroke_order"])
-    
-    point_count = 0
-    for stroke in strokes:
-        if stroke.type == 'CURVE':
-            stroke_data = stroke.data
-            curve_copy = stroke_data.copy()
-            playback_state["original_curves"][stroke.name] = curve_copy
-            
-            for spline in stroke_data.splines:
-                point_count += len(spline.bezier_points)
-    
-    playback_state["total_points"] = point_count
+    playback_state = {"total_points": len(strokes)}
+
+    # hide all strokes at start
+    update_playback_frame(context, 0)
+
 
 def update_playback_frame(context, frame_num):
-    """Update visibility of points for the current frame"""
-    global playback_state
+    """Update visibility of recorded strokes for the current frame"""
     strokes = [o for o in context.scene.objects if "inkstroke_order" in o]
     strokes.sort(key=lambda x: x["inkstroke_order"])
     
-    points_to_show = frame_num
-    points_shown = 0
-    
-    for stroke in strokes:
-        if stroke.type == 'CURVE':
-            stroke_data = stroke.data
-            
-            # Show/hide points in this stroke
-            for spline in stroke_data.splines:
-                bezier_points = spline.bezier_points
-                for i, bp in enumerate(bezier_points):
-                    if points_shown < points_to_show:
-                        bp.hide = False
-                        points_shown += 1
-                    else:
-                        bp.hide = True
+    visible_count = max(0, min(frame_num, len(strokes)))
+    for i, stroke in enumerate(strokes):
+        hide = i >= visible_count
+        stroke.hide_set(hide)
+        stroke.hide_render = hide
+
 
 def update_replay_frame(self, context):
     """Callback when replay_frame property changes"""
@@ -1043,7 +1127,7 @@ class INKSTROKE_OT_playback(bpy.types.Operator):
             # Pause/resume
             wm = context.window_manager
             wm.event_timer_remove(self._timer)
-            self._timer = wm.event_timer_add(0.1, window=context.window)
+            self._timer = wm.event_timer_add(0.5, window=context.window)
             return {'RUNNING_MODAL'}
         
         return {'RUNNING_MODAL'}
@@ -1053,7 +1137,7 @@ class INKSTROKE_OT_playback(bpy.types.Operator):
         context.scene.inkstroke_settings.replay_frame = 0
         
         wm = context.window_manager
-        self._timer = wm.event_timer_add(0.1, window=context.window)
+        self._timer = wm.event_timer_add(0.5, window=context.window) # speed of animating
         wm.modal_handler_add(self)
         
         # Register frame change handler
@@ -1084,6 +1168,36 @@ class INKSTROKE_OT_clear_replay(bpy.types.Operator):
         settings.replay_frame = playback_state["total_points"]
         return {'FINISHED'}
 
+class INKSTROKE_OT_set_thin_brush(bpy.types.Operator):
+    bl_idname = "inkstroke.set_thin_brush"
+    bl_label = "Thin Brush"
+    bl_description = "Set brush to thin width (0.1)"
+
+    def execute(self, context):
+        settings = context.scene.inkstroke_settings
+        settings.width = 0.1
+        return {'FINISHED'}
+    
+class INKSTROKE_OT_set_med_brush(bpy.types.Operator):
+    bl_idname = "inkstroke.set_med_brush"
+    bl_label = "Medium Brush"
+    bl_description = "Set brush to medium width (0.2)"
+
+    def execute(self, context):
+        settings = context.scene.inkstroke_settings
+        settings.width = 0.2
+        return {'FINISHED'}
+
+class INKSTROKE_OT_set_thick_brush(bpy.types.Operator):
+    bl_idname = "inkstroke.set_thick_brush"
+    bl_label = "Thick Brush"
+    bl_description = "Set brush to thick width (1.0)"
+
+    def execute(self, context):
+        settings = context.scene.inkstroke_settings
+        settings.width = 0.5
+        return {'FINISHED'}
+
 # 
 # UI Panel
 # -----------------------------
@@ -1097,33 +1211,46 @@ class INKSTROKE_PT_panel(Panel):
     def draw(self, context):
         layout = self.layout
         settings = context.scene.inkstroke_settings
+        
+        box = layout.box()
+        box.label(text="InkStroke Tools")
+        box.prop(settings, "use_projection")
+        box.prop(settings, "min_distance")
+        box.prop(settings, "width")
+        box.prop(settings, "width_falloff")
+        box.prop(settings, "panel_mode")
+        if settings.panel_mode:
+            box.prop(settings, "panel_depth")
+        box.operator("inkstroke.set_panel_depth", text="Set Panel Depth")
+        box.operator("inkstroke.draw", text="Draw", icon='GREASEPENCIL')
 
-        layout.prop(settings, "use_projection")
-        layout.prop(settings, "min_distance")
-        layout.prop(settings, "width")
-        layout.prop(settings, "width_falloff")
-        layout.prop(settings, "panel_mode")
-        
-        layout.operator("inkstroke.set_panel_depth", text="Set Panel Depth")
-        layout.operator("inkstroke.draw", text="Draw", icon='GREASEPENCIL')
-        layout.operator("inkstroke.generate_bands", text="Generate Bands")
-        layout.operator("inkstroke.radius_tool", text="Radius Tool")
-        
-        # Recording & Replay
-        layout.separator()
-        layout.label(text="Recording")
-        layout.prop(settings, "recording_enabled", text="Record Strokes")
-        
+        box = layout.box()
+        box.label(text="Mesh Generation")
+        # box.operator("inkstroke.generate_bands", text="Generate Bands")
+        box.operator("inkstroke.radius_tool", text="Radius Tool")
+        box.operator("inkstroke.apply_material", text="Apply Ink Material")
+
+        box = layout.box()
+        box.label(text="Playback")
+        box.prop(settings, "recording_enabled", text="Record Strokes")
+
         strokes = [o for o in context.scene.objects if "inkstroke_order" in o]
-        if strokes:
-            total_points = sum(
-                len(s.data.splines[0].bezier_points) 
-                for s in strokes if s.type == 'CURVE' and len(s.data.splines) > 0
-            )
-            if total_points > 0:
-                layout.prop(settings, "replay_frame", slider=True, text=f"Replay ({settings.replay_frame}/{total_points})")
-                layout.operator("inkstroke.playback", text="Animate Playback")
-                layout.operator("inkstroke.clear_replay", text="Show All Strokes")
+        total_points = sum(
+            len(s.data.splines[0].bezier_points)
+            for s in strokes if s.type == 'CURVE' and len(s.data.splines) > 0
+        )
+        if total_points > 0:
+            box.prop(settings, "replay_frame", slider=True, text=f"Replay ({settings.replay_frame}/{total_points})")
+            box.operator("inkstroke.playback", text="Animate Playback")
+            box.operator("inkstroke.clear_replay", text="Show All Strokes")
+
+        box = layout.box()
+        box.label(text="Presets")
+        # box.prop(settings, "stroke_preset")
+        # box.operator("inkstroke.load_preset", text="Load Stroke Preset")
+        box.operator("inkstroke.set_thin_brush", text="Thin Brush")
+        box.operator("inkstroke.set_med_brush", text="Medium Brush")
+        box.operator("inkstroke.set_thick_brush", text="Thick Brush")
         # layout.operator("inkstroke.generate_tube", text="Generate Tube")
 
 
@@ -1137,9 +1264,14 @@ classes = (
     INKSTROKE_OT_generate_tube,
     INKSTROKE_OT_playback,
     INKSTROKE_OT_clear_replay,
+    INKSTROKE_OT_apply_material,
+    INKSTROKE_OT_load_preset,
     INKSTROKE_PT_panel,
     INKSTROKE_OT_radius_tool,
-    INKSTROKE_OT_set_panel_depth
+    INKSTROKE_OT_set_panel_depth,
+    INKSTROKE_OT_set_thin_brush,
+    INKSTROKE_OT_set_med_brush,
+    INKSTROKE_OT_set_thick_brush
 )
 
 def register():
@@ -1149,8 +1281,6 @@ def register():
         type=InkStrokeSettings
     )
 
-    settings = bpy.context.scene.inkstroke_settings
-    
     if inkstroke_live_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(inkstroke_live_update)
 
